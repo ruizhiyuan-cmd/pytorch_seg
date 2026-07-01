@@ -21,9 +21,13 @@ class RidgepathSegModel(nn.Module):
     def __init__(self, encoder_name="resnet18", in_chans=2, num_classes=9,
                  fpn_min_level=2, fpn_max_level=5, fpn_filters=32,
                  head_level=2, head_filters=32, head_num_convs=2,
-                 prediction_kernel_size=1, final_upsample_mode="bilinear"):
+                 prediction_kernel_size=1, final_upsample_mode="bilinear",
+                 encoder_norm="bn", gn_max_groups=32):
         super().__init__()
-        self.encoder = build_encoder(encoder_name, in_chans)
+        # Only the ENCODER may switch to GroupNorm (SSL->seg handoff needs matching norm/keys); the
+        # FPN + head stay BatchNorm (never masked, never cross the SSL boundary).
+        self.encoder = build_encoder(encoder_name, in_chans, encoder_norm=encoder_norm,
+                                     gn_max_groups=gn_max_groups)
         self.fpn = FPN(self.encoder.output_specs, fpn_min_level, fpn_max_level, fpn_filters)
         self.head = SegmentationHead(
             num_classes=num_classes, level=head_level, in_channels=fpn_filters,
@@ -43,10 +47,16 @@ class RidgepathSegModel(nn.Module):
         return out
 
 
-def build_seg_model(encoder_name="resnet18", in_chans=2, num_classes=9, **overrides):
-    """Construct a RidgepathSegModel with backbone-appropriate resolution defaults."""
+def build_seg_model(encoder_name="resnet18", in_chans=2, num_classes=9,
+                    encoder_norm="bn", gn_max_groups=32, **overrides):
+    """Construct a RidgepathSegModel with backbone-appropriate resolution defaults.
+
+    ``encoder_norm='gn'`` builds a GroupNorm encoder (for loading an iBOT/DINOv2 GN-pretrained
+    checkpoint); default ``'bn'`` is unchanged.
+    """
     defaults = dict(fpn_min_level=2, fpn_max_level=5, fpn_filters=32,
-                    head_filters=32, head_num_convs=2, prediction_kernel_size=1)
+                    head_filters=32, head_num_convs=2, prediction_kernel_size=1,
+                    encoder_norm=encoder_norm, gn_max_groups=gn_max_groups)
     if encoder_name == "tenxnet_recipe":
         # faithful test.yaml: FPN includes endpoint "1" (min_level 1, P1-P5); fuse to level 1 (full res).
         defaults.update(fpn_min_level=1, head_level=1, final_upsample_mode="bilinear")

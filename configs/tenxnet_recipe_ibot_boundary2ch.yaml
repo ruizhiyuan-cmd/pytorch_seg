@@ -1,0 +1,38 @@
+# Tenxnet_recipe boundary segmentation, initialized from an iBOT/DINOv2-style SSL encoder that uses
+# GroupNorm (encoder_norm: gn). Mirrors tenxnet_recipe_dino_boundary2ch_curated.yaml EXCEPT:
+#   - encoder_norm: gn      (the SSL encoder is GroupNorm; keys align only if the seg encoder is too)
+#   - dino_checkpoint       (points at the iBOT run instead of the DINO v1 run)
+# Use only AFTER the iBOT SSL run has produced a checkpoint.
+encoder: tenxnet_recipe                 # v1 stem, SD 0.5, endpoints 1..5 (FPN min_level 1)
+encoder_norm: gn                        # GroupNorm encoder to match the iBOT SSL backbone key-for-key
+gn_max_groups: 32                       # MUST equal the SSL run's gn_max_groups
+in_chans: 2
+num_classes: 9
+
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train_labeled.csv   # 325 labeled tiles
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val_labeled.csv  # 57 labeled tiles
+augment: true
+seg_channels: [boundary, DAPI]          # large_cell_boundary image order: ch0=boundary, ch1=DAPI
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}  # == test.yaml
+
+# --- SSL init from the 2-channel boundary iBOT run (GroupNorm tenxnet_recipe backbone) ---
+init: dino
+dino_checkpoint: /mnt/home/ruizhi.yuan/ssl_dino/out_boundary_2ch_ibot/checkpoint.pth
+dino_which: teacher                     # EMA teacher trunk (smoother features)
+ssl_channels: [boundary, DAPI]          # 2-ch SSL stem-conv order -> identity map to seg_channels (no slicing)
+
+optimizer: adamw
+lr: 0.001                               # base/decoder LR (FPN + head, incl. the direction heads)
+encoder_lr: 0.00005                     # gentle fine-tune of the SSL-pretrained encoder
+weight_decay: 0.0001
+lr_schedule: cosine
+warmup_epochs: 5
+epochs: 100
+batch_size: 8                          # per-GPU
+num_workers: 8
+amp: true
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_ibot_boundary2ch
+seed: 0
+save_every: 10
+log_every: 20

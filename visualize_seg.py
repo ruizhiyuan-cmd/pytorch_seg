@@ -69,7 +69,9 @@ def main():
         raise FileNotFoundError(f"checkpoint not found: {ckpt}")
 
     model = build_seg_model(encoder_name=cfg["encoder"], in_chans=cfg["in_chans"],
-                            num_classes=cfg["num_classes"]).to(device)
+                            num_classes=cfg["num_classes"],
+                            encoder_norm=cfg.get("encoder_norm", "bn"),
+                            gn_max_groups=cfg.get("gn_max_groups", 32)).to(device)
     ck = torch.load(ckpt, map_location=device, weights_only=False)
     model.load_state_dict(ck["model"])  # save_ckpt stores the raw (unwrapped) module state_dict
     model.eval()

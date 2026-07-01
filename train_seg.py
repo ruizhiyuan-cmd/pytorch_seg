@@ -32,6 +32,7 @@ from restore import restore_dino_into_resnet18, restore_dino_into_tenxnet
 
 DEFAULTS = dict(
     encoder="resnet18", in_chans=2, num_classes=9,
+    encoder_norm="bn", gn_max_groups=32,  # 'gn' -> GroupNorm encoder (for iBOT/DINOv2 GN checkpoints)
     manifest="/mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest.csv",
     val_manifest=None, augment=True,
     target_params=dict(dist_cutoff=15.0, weight_sigma=1.0, smooth_range=3, weighted_loss=True),
@@ -241,7 +242,8 @@ def main():
 
     # model
     model = build_seg_model(encoder_name=cfg["encoder"], in_chans=cfg["in_chans"],
-                            num_classes=cfg["num_classes"]).to(device)
+                            num_classes=cfg["num_classes"], encoder_norm=cfg["encoder_norm"],
+                            gn_max_groups=cfg["gn_max_groups"]).to(device)
     if cfg["init"] == "dino":
         if is_main(rank):
             if cfg["encoder"] == "resnet18":

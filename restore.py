@@ -20,14 +20,25 @@ BACKBONE_PREFIX = "module.backbone."
 
 
 def load_dino_backbone_state_dict(ckpt_path, which="student"):
-    """Return (backbone_state_dict, epoch) with the ``module.backbone.`` prefix stripped."""
+    """Return (backbone_state_dict, epoch) with any wrapper prefix before ``backbone.`` stripped.
+
+    DDP-wrapped modules store the backbone as ``module.backbone.*``; a non-DDP module (e.g. the
+    GroupNorm iBOT teacher, which is not DDP-wrapped because it has no BatchNorm buffers to sync)
+    stores it as plain ``backbone.*``. Strip an optional leading ``module.`` first, then ``backbone.``.
+    """
     ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
     if which not in ck:
         raise KeyError(f"'{which}' not in checkpoint (keys: {list(ck.keys())})")
     sd = ck[which]
-    bb = {k[len(BACKBONE_PREFIX):]: v for k, v in sd.items() if k.startswith(BACKBONE_PREFIX)}
+    bb = {}
+    for k, v in sd.items():
+        kk = k[len("module."):] if k.startswith("module.") else k
+        if kk.startswith("backbone."):
+            bb[kk[len("backbone."):]] = v
     if not bb:
-        raise ValueError(f"no '{BACKBONE_PREFIX}*' keys in checkpoint['{which}']")
+        raise ValueError(
+            f"no 'backbone.*' (or 'module.backbone.*') keys in checkpoint['{which}'] "
+            f"(sample keys: {list(sd)[:5]})")
     return bb, ck.get("epoch")
 
 
