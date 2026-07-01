@@ -1,0 +1,42 @@
+# Tenxnet_small boundary segmentation, initialized from the 2-channel boundary DINO SSL encoder
+# trained with the MATCHING tenxnet_small backbone (ssl_dino/configs/boundary_2ch_tenxnet_small_full.yaml).
+# The DINO trunk param names equal this encoder's, so restore is a full load of model.encoder
+# (loaded=ALL, missing=0, unexpected=0; DINOHead dropped). The v0 stem's input conv is stem.0.weight
+# (auto-detected by restore_dino_into_tenxnet). Encoder is fine-tuned (UNFROZEN) end-to-end.
+# Fair SSL ablation: pair with tenxnet_small_scratch.yaml (same settings, init scratch vs dino).
+encoder: tenxnet_small                  # v0 stem, no SD, endpoints 2..5 (FPN min_level 2)
+in_chans: 2
+num_classes: 9
+
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train.csv
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val.csv
+augment: true
+seg_channels: [boundary, DAPI]          # large_cell_boundary image order: ch0=boundary, ch1=DAPI
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
+
+# --- SSL init from the 2-channel boundary DINO run (tenxnet_small backbone) ---
+init: dino
+dino_checkpoint: /mnt/home/ruizhi.yuan/ssl_dino/out_boundary_2ch_tenxnet_small_dino/checkpoint.pth
+dino_which: teacher                     # EMA teacher trunk (smoother features)
+ssl_channels: [boundary, DAPI]          # 2-ch SSL stem-conv order -> identity map to seg_channels (no slicing)
+# NOTE: SSL used meanstd normalization; seg uses positive/p99 -> input-distribution shift at init that
+#       end-to-end fine-tuning (weights + BN running stats) absorbs.
+
+optimizer: adamw
+lr: 0.001                               # base/decoder LR (FPN + head)
+encoder_lr: 0.00005                      # lower LR for the DINO-pretrained encoder (fine-tune gently);
+                                         # set == lr (or remove) to train the encoder at the base LR
+weight_decay: 0.0001
+lr_schedule: cosine
+warmup_epochs: 5
+epochs: 100
+# tenxnet_small's FPN min_level 2 (no full-res P1) is lighter than tenxnet_recipe, so it fits a larger
+# batch. Keep this EQUAL to tenxnet_small_scratch.yaml for a fair DINO-vs-scratch ablation.
+batch_size: 32                          # per-GPU
+num_workers: 8
+amp: true
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_small_dino_boundary2ch
+seed: 42
+save_every: 10
+log_every: 20

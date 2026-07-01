@@ -1,0 +1,31 @@
+# ResNet18 encoder, initialized from the DINO SSL student backbone. SSL ablation treatment
+# (pair with r18_scratch.yaml -> the fair "does SSL pretraining help" comparison).
+encoder: resnet18
+in_chans: 2
+num_classes: 9
+
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train.csv
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val.csv
+augment: true
+seg_channels: [boundary, DAPI]          # large_cell_boundary image order: ch0=boundary, ch1=DAPI
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
+
+init: dino
+dino_checkpoint: /mnt/home/ruizhi.yuan/ssl_dino/out_full/checkpoint.pth
+dino_which: student
+ssl_channels: [DAPI, boundary, 18S, avim]   # DINO conv1 input order (4ch). Slices to seg_channels by name.
+
+optimizer: adamw
+lr: 0.001
+weight_decay: 0.0001
+lr_schedule: cosine
+warmup_epochs: 5
+epochs: 100
+batch_size: 8
+num_workers: 8
+amp: true
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/r18_dino
+seed: 0
+save_every: 10
+log_every: 20

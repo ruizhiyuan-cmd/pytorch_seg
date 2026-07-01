@@ -1,0 +1,29 @@
+# Tenxnet_recipe boundary segmentation, RANDOM init (trained from scratch). SSL-ablation CONTROL:
+# pair with tenxnet_recipe_dino_boundary2ch.yaml -- identical except `init` (scratch vs dino) -> isolates
+# the SSL benefit for the tenxnet_recipe backbone (cf. r18_scratch vs r18_dino_boundary2ch for ResNet18).
+encoder: tenxnet_recipe                 # v1 stem, SD 0.5, endpoints 1..5 (FPN min_level 1)
+in_chans: 2
+num_classes: 9
+
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train.csv
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val.csv
+augment: true
+seg_channels: [boundary, DAPI]          # large_cell_boundary image order: ch0=boundary, ch1=DAPI
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
+
+init: scratch
+
+optimizer: adamw
+lr: 0.0005
+weight_decay: 0.0001
+lr_schedule: cosine
+warmup_epochs: 5
+epochs: 100
+batch_size: 24                          # per-GPU; match tenxnet_recipe_dino_boundary2ch for a fair ablation
+num_workers: 8
+amp: true
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_scratch
+seed: 0
+save_every: 10
+log_every: 20
