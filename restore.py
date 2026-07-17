@@ -194,3 +194,55 @@ def restore_dino_into_tenxnet(seg_model, ckpt_path, seg_channels, ssl_channels,
 
 # Back-compat alias: the recipe path is just the generic tenxnet restore (auto-detects the stem).
 restore_dino_into_tenxnet_recipe = restore_dino_into_tenxnet
+
+
+def restore_seg_encoder(seg_model, ckpt_path, verbose=True):
+    """Load ONLY the encoder subtree from a pytorch_seg checkpoint into ``seg_model.encoder``.
+
+    Used by the ``init: seg_encoder`` control experiment: take a train-from-scratch seg checkpoint,
+    keep its (trained) encoder, and DISCARD its decoder + output heads (those stay at random init in
+    ``seg_model`` -- we simply don't load them). The source checkpoint stores a full seg model under
+    ``ckpt["model"]`` with every encoder param prefixed ``encoder.``; we filter to those keys, strip
+    the prefix, and load into ``seg_model.encoder``.
+
+    The source and target encoder MUST be the same architecture + norm (e.g. both tenxnet_recipe BN)
+    so channels/keys align 1:1 -- no slicing, and we assert **0 missing encoder keys** (a partial
+    match would silently leave part of the encoder random, defeating the control). Raises otherwise.
+    """
+    target = seg_model.encoder
+    target_sd = target.state_dict()
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "model" not in ck:
+        raise KeyError(f"checkpoint has no 'model' key (keys: {list(ck.keys())})")
+    full_sd = ck["model"]
+    enc = {k[len("encoder."):]: v for k, v in full_sd.items() if k.startswith("encoder.")}
+    if not enc:
+        raise ValueError(f"no 'encoder.*' keys in checkpoint['model'] (sample: {list(full_sd)[:5]})")
+
+    tkeys, pkeys = set(target_sd), set(enc)
+    shape_mismatch = sorted(k for k in tkeys & pkeys if target_sd[k].shape != enc[k].shape)
+    if shape_mismatch:
+        details = [f"{k}: seg{tuple(target_sd[k].shape)} vs ckpt{tuple(enc[k].shape)}"
+                   for k in shape_mismatch]
+        raise ValueError("encoder shape mismatch on keys:\n  " + "\n  ".join(details))
+    missing = sorted(tkeys - pkeys)      # encoder keys absent from source ckpt -> would stay random
+    unexpected = sorted(pkeys - tkeys)   # source keys absent from target encoder
+    if missing:
+        raise ValueError(
+            f"source checkpoint is missing {len(missing)} encoder keys "
+            f"(would stay at random init, corrupting the frozen-encoder control): {missing[:8]}"
+            + (" ..." if len(missing) > 8 else "")
+            + "\n=> the source run's encoder must be the SAME architecture+norm as this config "
+              "(e.g. both tenxnet_recipe encoder_norm=bn).")
+
+    result = target.load_state_dict(enc, strict=False)
+    assert not result.missing_keys, result.missing_keys
+    assert set(result.unexpected_keys) == set(unexpected)
+
+    if verbose:
+        print(f"[restore] seg ENCODER-ONLY from {ckpt_path} (source epoch {ck.get('epoch','?')})")
+        print(f"[restore] loaded={len(tkeys & pkeys)} encoder tensors; "
+              f"decoder + heads left at RANDOM init (discarded from source)")
+        if unexpected:
+            print(f"[restore]   UNEXPECTED source encoder keys (ignored): {unexpected}")
+    return dict(loaded=sorted(tkeys & pkeys), unexpected=unexpected, epoch=ck.get("epoch"))

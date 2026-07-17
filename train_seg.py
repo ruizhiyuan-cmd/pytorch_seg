@@ -28,7 +28,7 @@ from torch.utils.data import DataLoader, DistributedSampler
 from data.seg_dataset import RidgepathSegDataset, seg_worker_init_fn
 from losses.ridgepath_loss import ridgepath_loss
 from models.encoder_decoder import build_seg_model
-from restore import restore_dino_into_resnet18, restore_dino_into_tenxnet
+from restore import restore_dino_into_resnet18, restore_dino_into_tenxnet, restore_seg_encoder
 
 DEFAULTS = dict(
     encoder="resnet18", in_chans=2, num_classes=9,
@@ -40,8 +40,14 @@ DEFAULTS = dict(
     seg_channels=["boundary", "DAPI"],
     init="scratch", dino_checkpoint="/mnt/home/ruizhi.yuan/ssl_dino/out_full/checkpoint.pth",
     dino_which="student", ssl_channels=["DAPI", "boundary", "18S", "avim"],
+    seg_checkpoint=None,  # init=seg_encoder: source pytorch_seg ckpt whose ENCODER is loaded (decoder/heads discarded)
+    freeze_encoder_eval=False,  # keep encoder in .eval() during training (freezes SD/dropout + BN running stats)
     optimizer="adamw", lr=1e-3, encoder_lr=None, weight_decay=1e-4, betas=[0.9, 0.999],
     lr_schedule="cosine", warmup_epochs=0, min_lr=1e-6,
+    lr_milestones=None, lr_values=None, lr_milestone_unit="steps",  # multistep: boundaries in "steps" or "epochs" + absolute LR per segment
+    freeze_encoder_epochs=0,  # LP-FT: hold encoder lr=0 for the first N epochs, then unfreeze (protects SSL features)
+    encoder_lr_follows_schedule=True,  # False -> encoder holds a constant encoder_lr (NOT scaled by the decoder's schedule factor)
+    grad_clip=1.0,  # clip grad-norm to this (None/<=0 disables); watch clip_frac in the log to tune it
     epochs=100, batch_size=8, num_workers=4, amp=True,
     out_dir="/mnt/home/ruizhi.yuan/pytorch_seg/runs/run", seed=0, save_every=10, log_every=10,
 )
@@ -70,11 +76,17 @@ def log_json(out_dir, record):
 
 
 # ----------------------------------------------------------------- lr schedule
-def lr_factor(step, total_steps, warmup_steps, schedule, min_ratio):
+def lr_factor(step, total_steps, warmup_steps, schedule, min_ratio, milestones=None, factors=None):
     if warmup_steps and step < warmup_steps:
         return step / max(1, warmup_steps)
     if schedule == "constant":
         return 1.0
+    if schedule == "multistep":
+        # PiecewiseConstantDecay on ABSOLUTE optimizer steps (== tenxnet stepwise). `milestones` are the
+        # step boundaries; `factors` (len = len(milestones)+1) are LR multipliers per segment relative to
+        # base lr. e.g. milestones [12000,18000], factors [1.0,0.2,0.1] with base lr 0.01 -> 0.01/0.002/0.001.
+        seg = sum(1 for m in (milestones or []) if step >= m)
+        return factors[seg]
     progress = (step - warmup_steps) / max(1, total_steps - warmup_steps)
     progress = min(max(progress, 0.0), 1.0)
     if schedule == "cosine":
@@ -257,6 +269,24 @@ def main():
                     "init=dino requires encoder in {resnet18, tenxnet_recipe, tenxnet_small}")
         if ddp:
             dist.barrier()
+    elif cfg["init"] == "seg_encoder":
+        # Frozen-scratch-encoder control: load ONLY the encoder from a train-from-scratch seg ckpt;
+        # decoder + heads stay at random init. Source encoder must match this config's arch+norm.
+        if not cfg["seg_checkpoint"]:
+            raise ValueError("init=seg_encoder requires 'seg_checkpoint' in the config")
+        if is_main(rank):
+            restore_seg_encoder(model, cfg["seg_checkpoint"])
+        if ddp:
+            dist.barrier()   # DDP wrap below broadcasts rank-0 weights to all replicas
+    # LP-FT: TRULY freeze the encoder (requires_grad=False -> no encoder backward, no grads in the clip
+    # norm, pristine optimizer state) for the first N epochs. Set BEFORE the DDP wrap so the reducer
+    # excludes the encoder; we re-wrap DDP at unfreeze so the encoder's grads sync across ranks.
+    enc_frozen = bool(cfg["freeze_encoder_epochs"])
+    if enc_frozen:
+        model.encoder.requires_grad_(False)
+        if is_main(rank):
+            print(f"[freeze] encoder requires_grad=False for epochs 0..{cfg['freeze_encoder_epochs']-1} "
+                  f"(re-wraps DDP at unfreeze so grads sync)")
     if ddp:
         model = DDP(model, device_ids=([local_rank] if torch.cuda.is_available() else None))
 
@@ -273,20 +303,46 @@ def main():
     enc_ids = {id(p) for p in enc_params}
     dec_params = [p for p in core.parameters() if id(p) not in enc_ids]
     param_groups = [
-        {"params": dec_params, "lr": base_lr, "base_lr": base_lr},   # FPN + head
-        {"params": enc_params, "lr": enc_lr, "base_lr": enc_lr},     # encoder
+        {"params": dec_params, "lr": base_lr, "base_lr": base_lr},                    # FPN + head
+        {"params": enc_params, "lr": enc_lr, "base_lr": enc_lr, "is_encoder": True},  # encoder
     ]
     opt = torch.optim.AdamW(param_groups, lr=base_lr, betas=tuple(cfg["betas"]),
                             weight_decay=cfg["weight_decay"])
     if is_main(rank):
+        frz = cfg["freeze_encoder_epochs"]
         print(f"[optim] decoder lr={base_lr:.2e} | encoder lr={enc_lr:.2e} "
-              f"({len(dec_params)} decoder + {len(enc_params)} encoder tensors)")
-    scaler = torch.amp.GradScaler("cuda", enabled=(cfg["amp"] and device.type == "cuda"))
+              f"({len(dec_params)} decoder + {len(enc_params)} encoder tensors)"
+              + (f" | encoder FROZEN (lr=0) for first {frz} epochs, then unfreeze" if frz else ""))
+    # AMP uses float16 (T4/Turing has fp16 tensor cores but runs bf16 unaccelerated -> bf16 too slow).
+    # fp16 needs the GradScaler: it rescues NON-finite GRADIENTS (backward overflow) by skipping the
+    # step + backing off the scale. A non-finite LOSS (forward overflow) can't be rescaled away and is
+    # handled separately in the loop (skip the batch, don't crash). amp=false -> fp32 native.
+    amp_on = cfg["amp"] and device.type == "cuda"
+    scaler = torch.amp.GradScaler("cuda", enabled=amp_on)
 
     _, loader, sampler = build_loader(cfg["manifest"], cfg, ddp, shuffle=True, augment=cfg["augment"])
     steps_per_epoch = max(1, len(loader))
     total_steps = steps_per_epoch * cfg["epochs"]
     warmup_steps = steps_per_epoch * cfg["warmup_epochs"]
+
+    ms_milestones, ms_factors = None, None
+    if cfg["lr_schedule"] == "multistep":
+        raw_ms = list(cfg["lr_milestones"] or [])
+        unit = cfg["lr_milestone_unit"]
+        if unit == "epochs":                              # convert epoch boundaries -> absolute step boundaries
+            ms_milestones = [int(round(m * steps_per_epoch)) for m in raw_ms]
+        elif unit == "steps":
+            ms_milestones = [int(m) for m in raw_ms]
+        else:
+            raise ValueError(f"lr_milestone_unit must be 'steps' or 'epochs', got {unit!r}")
+        vals = list(cfg["lr_values"] or [cfg["lr"]])
+        if len(vals) != len(ms_milestones) + 1:
+            raise ValueError(f"lr_values (len {len(vals)}) must be len(lr_milestones)+1 "
+                             f"({len(ms_milestones)}+1) for multistep")
+        ms_factors = [v / cfg["lr"] for v in vals]     # absolute LR values -> multipliers on base lr
+        if is_main(rank):
+            print(f"[lr] multistep: milestones={raw_ms} {unit} -> steps {ms_milestones} "
+                  f"values={vals} (steps/epoch={steps_per_epoch}, factors={ms_factors})")
 
     # per-epoch validation (main rank only; un-sharded full val set) + best-checkpoint tracking.
     # We keep just two checkpoints: best.pth (lowest val loss, overwritten on improvement) and
@@ -312,38 +368,81 @@ def main():
     gstep = start_epoch * steps_per_epoch
     stop = False
     for epoch in range(start_epoch, cfg["epochs"]):
+        if enc_frozen and epoch >= cfg["freeze_encoder_epochs"]:   # unfreeze (also fires on resume past the window)
+            core.encoder.requires_grad_(True)
+            if ddp:
+                dist.barrier()   # re-wrap so the reducer now includes the encoder -> its grads all-reduce
+                model = DDP(core, device_ids=([local_rank] if torch.cuda.is_available() else None))
+            eval_model = model.module if isinstance(model, DDP) else model
+            enc_frozen = False
+            if is_main(rank):
+                print(f"[freeze] epoch {epoch}: UNFROZE encoder + re-wrapped DDP (encoder grads now sync)")
         model.train()
+        if cfg["freeze_encoder_eval"]:
+            # keep the (frozen) encoder in eval mode so stochastic-depth/dropout are off and BN uses
+            # its frozen running stats -- a truly fixed feature extractor. Re-applied every epoch
+            # because model.train() above flips the whole tree back to train mode.
+            core.encoder.eval()
         if sampler:
             sampler.set_epoch(epoch)
         # vary augmentation across epochs: workers reseed via seg_worker_init_fn (torch base_seed
         # advances per epoch); the num_workers=0 path reseeds numpy here.
         if cfg["num_workers"] == 0:
             np.random.seed(cfg["seed"] + epoch)
-        ep = {"loss": 0.0, "seg": 0.0, "row": 0.0, "col": 0.0, "n": 0}  # per-epoch train accumulators
+        ep = {"loss": 0.0, "seg": 0.0, "row": 0.0, "col": 0.0, "n": 0,
+              "gnorm": 0.0, "nclip": 0, "nskip": 0}  # train accumulators (+ grad-norm/clip/skipped-batch counts)
         for it, (img, tgt) in enumerate(loader):
             img, tgt = img.to(device), tgt.to(device)
             factor = lr_factor(gstep, total_steps, warmup_steps,
-                               cfg["lr_schedule"], cfg["min_lr"] / cfg["lr"])
+                               cfg["lr_schedule"], cfg["min_lr"] / cfg["lr"],
+                               milestones=ms_milestones, factors=ms_factors)
+            frozen_enc = epoch < cfg["freeze_encoder_epochs"]   # LP-FT: encoder held at lr=0 early
+            enc_follows = cfg["encoder_lr_follows_schedule"]
             for g in opt.param_groups:
-                g["lr"] = g["base_lr"] * factor   # per-group base (decoder vs encoder) x shared schedule
-            with torch.autocast(device_type=device.type, enabled=(cfg["amp"] and device.type == "cuda")):
+                if g.get("is_encoder"):
+                    # frozen -> 0; else follow the schedule factor, OR hold a constant encoder_lr (decoupled)
+                    g["lr"] = 0.0 if frozen_enc else (g["base_lr"] * factor if enc_follows else g["base_lr"])
+                else:
+                    g["lr"] = g["base_lr"] * factor   # decoder/head always follows the schedule
+            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_on):
                 logits = model(img)
                 loss, seg, row, col = ridgepath_loss(logits, tgt)
-            if not torch.isfinite(loss):
-                raise FloatingPointError(f"non-finite loss at step {gstep}: {loss.item()}")
+            # fp16 forward overflow (esp. once the deep SSL encoder is unfrozen): an inf activation ->
+            # NaN loss. Rescaling can't fix a forward NaN, so SKIP this batch instead of crashing --
+            # params stay finite and training continues. Occasional skips are harmless; a persistent
+            # stream of them means lower the LR / add encoder-LR warmup. (Non-finite GRADS from backward
+            # overflow are handled below by the GradScaler: it skips the step and backs off the scale.)
+            bad = torch.tensor(0.0 if torch.isfinite(loss) else 1.0, device=device)
+            if ddp:
+                dist.all_reduce(bad, op=dist.ReduceOp.MAX)   # all ranks skip together (no collective hang)
+            if bad.item() > 0:
+                opt.zero_grad(set_to_none=True)
+                if is_main(rank):
+                    ep["nskip"] += 1
+                    if gstep % cfg["log_every"] == 0:
+                        print(f"epoch {epoch} it {it} gstep {gstep} | NON-FINITE loss -> skipped batch")
+                gstep += 1
+                continue
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
-            scaler.step(opt)
+            gnorm = None
+            if cfg["grad_clip"] and cfg["grad_clip"] > 0:
+                scaler.unscale_(opt)                                   # AMP: unscale BEFORE clipping (no-op if amp off)
+                gnorm = float(torch.nn.utils.clip_grad_norm_(model.parameters(), cfg["grad_clip"]))
+            scaler.step(opt)                                           # DDP grads already all-reduced -> all ranks clip identically
             scaler.update()
             if is_main(rank):
                 ep["loss"] += loss.item(); ep["seg"] += seg.item()
                 ep["row"] += row.item(); ep["col"] += col.item(); ep["n"] += 1
+                if gnorm is not None:
+                    ep["gnorm"] += gnorm; ep["nclip"] += int(gnorm > cfg["grad_clip"])
                 if gstep % cfg["log_every"] == 0:
                     lr_dec = opt.param_groups[0]["lr"]; lr_enc = opt.param_groups[1]["lr"]
                     enc_str = f"/enc {lr_enc:.2e}" if lr_enc != lr_dec else ""
+                    gstr = f" | gnorm {gnorm:.2f}{'*' if gnorm > cfg['grad_clip'] else ''}" if gnorm is not None else ""
                     print(f"epoch {epoch} it {it} gstep {gstep} | loss {loss.item():.4f} "
                           f"(seg {seg.item():.4f} row {row.item():.4f} col {col.item():.4f}) "
-                          f"lr {lr_dec:.2e}{enc_str}")
+                          f"lr {lr_dec:.2e}{enc_str}{gstr}")
             gstep += 1
             if args.max_iters is not None and gstep >= args.max_iters:
                 stop = True
@@ -371,6 +470,11 @@ def main():
                 "train_col": ep["col"] / ep["n"], "lr": opt.param_groups[0]["lr"],
                 "lr_encoder": opt.param_groups[1]["lr"], "n_steps": ep["n"],
             }
+            if cfg["grad_clip"] and cfg["grad_clip"] > 0:
+                rec["grad_norm"] = ep["gnorm"] / ep["n"]     # mean PRE-clip grad norm (tune grad_clip against this)
+                rec["clip_frac"] = ep["nclip"] / ep["n"]     # fraction of steps that hit the clip (~1.0 => raise grad_clip)
+            if ep["nskip"]:
+                rec["n_skip"] = ep["nskip"]                  # batches skipped for non-finite (fp16 forward overflow)
             if val is not None:
                 rec.update(val_loss=val["loss"], val_seg=val["seg"],
                            val_row=val["row"], val_col=val["col"],

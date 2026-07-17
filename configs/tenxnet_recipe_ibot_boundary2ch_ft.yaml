@@ -22,23 +22,25 @@ dino_which: teacher                     # EMA teacher trunk (smoother features)
 ssl_channels: [boundary, DAPI]          # 2-ch SSL stem-conv order -> identity map to seg_channels (no slicing)
 
 optimizer: adamw
-lr: 0.01                               # base/decoder LR (FPN + head, incl. the direction heads)
-encoder_lr: 0.00005                     # gentle fine-tune of the SSL-pretrained encoder
+lr: 0.01                               # base/decoder LR (FPN + head, incl. the direction heads) -- follows multistep
+encoder_lr: 0.0002                     # gentle fine-tune of the SSL-pretrained encoder
+encoder_lr_follows_schedule: false      # encoder holds a CONSTANT 5e-5 (not scaled by the multistep factor)
 weight_decay: 0.0001
 lr_schedule: constant
 # lr_milestone_unit: epochs               # interpret lr_milestones as epochs (converted to steps at setup)
-# lr_milestones: [50, 180]
+# lr_milestones: [60, 180]
 # lr_values: [0.01, 0.003, 0.001]  
 warmup_epochs: 5
 epochs: 500
-batch_size: 20                          # per-GPU
+batch_size: 16                          # per-GPU
 num_workers: 8
-amp: true
-grad_clip: 5.0
-freeze_encoder_epochs: 500
+amp: false                              # fp32: no fp16 overflow -> the GradScaler + non-finite-loss skip
+                                        # are inert (never fire), so no NaN/inf insurance needed here
+grad_clip: null                         # null (or 0) disables grad clipping; do NOT use `none` (parsed as a string -> crashes)
+freeze_encoder_epochs: 0
 
 
-out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_ibot_boundary2ch
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_ibot_boundary2ch_ft
 seed: 0
 save_every: 10
 log_every: 20

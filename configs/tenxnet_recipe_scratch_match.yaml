@@ -1,0 +1,48 @@
+# Tenxnet_recipe FROM SCRATCH, matched to Fangda's proven 0.25x training recipe (params.yaml) as
+# closely as train_seg.py allows -- goal: reproduce his "trains from scratch on half-empty tiles
+# WITHOUT direction-head collapse". Same arch/aug/loss/ridgepath params as tenxnet_recipe; the changes
+# vs tenxnet_recipe_scratch.yaml are all in the OPTIMIZATION recipe (that's where his run differs).
+#
+# His recipe: Adam (no weight decay, no grad clip), CONSTANT lr 0.001, NO warmup, fp32 (no AMP),
+#             global batch 88 (4 GPUs), single LR for all params, ~1000 epochs, scratch/warm-start.
+#
+# >>> CRITICAL LR<->BATCH COUPLING <<<
+# train_seg.py does NOT scale lr by world size. His (batch 88, lr 0.001) is the proven point. So:
+#   * Run on 4 GPUs at batch_size: 22  -> total 88, lr 0.001   (the intended match), OR
+#   * If you can't fit that, SCALE lr linearly:  lr = 0.001 * (total_batch / 88).
+#     e.g. 1 GPU batch 22 -> lr ~2.5e-4 ; batch 8 -> lr ~9e-5.  (batch 8 @ lr 1e-3 = the 11x-too-hot
+#     setting that collapsed the curated run -- do NOT do that.)
+
+encoder: tenxnet_recipe                 # v1 stem, SD 0.5, endpoints 1..5 (FPN min_level 1) == his model{}
+in_chans: 2
+num_classes: 9
+
+# LOCAL manifests (images in ~/data, labels in cache/inst_ridge) -- avoids the broken /mnt/deck mount.
+# 817 tiles total (733 train / 84 val), leakage-safe slide-group split. Built by data/build_local_manifest.py.
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train_local.csv
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val_local.csv
+augment: true                           # DEFAULT_AUG == his train_transform (colorquant/norm/bright/mirror/rot)
+seg_channels: [boundary, DAPI]
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}  # == his parser
+
+init: scratch                           # random encoder + decoder + heads (you have no 1x checkpoint)
+
+# --- optimization: match Adam / constant-LR / no-warmup / fp32 / single-LR ---
+optimizer: adamw                        # train_seg hardcodes AdamW; weight_decay 0 makes it == Adam
+weight_decay: 0.0                       # == his Adam (no weight decay)
+betas: [0.9, 0.999]                     # == his beta_1/beta_2 (eps differs 1e-8 vs his 1e-7; negligible)
+lr: 0.001                               # constant, matched to total batch 88 (SCALE if batch != 88; see top)
+encoder_lr: null                        # null -> encoder uses the SAME lr as decoder/head (his single LR)
+lr_schedule: constant                   # == his Constant schedule (no cosine)
+warmup_epochs: 0                        # == his warmup: null
+epochs: 300                             # he used 1000; collapse (if any) shows by ~epoch 10-20, so 300 is
+                                        # enough to confirm no-collapse. Raise toward 1000 for a real model.
+batch_size: 22                          # PER GPU. Run on 4 GPUs -> total 88 (his global_batch_size). If it
+                                        # OOMs, lower it AND lower lr proportionally (see top-of-file note).
+num_workers: 8
+amp: true                              # fp32, == his mixed_precision_dtype: null
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_scratch_match
+seed: 42                                # == his data_split/random_aug rng seed 42
+save_every: 10
+log_every: 20

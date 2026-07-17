@@ -23,11 +23,11 @@ ROOT = ("/mnt/deck/1/ruizhi.yuan/tenxnet_deployed_data/large_cell_boundary_full/
 CACHE = "/mnt/home/ruizhi.yuan/pytorch_seg/cache"
 
 
-def list_pairs():
+def list_pairs(root=ROOT):
     """All (subdir, base, image_path, label_path) with both .tif image and .pb label present."""
     pairs = []
-    img_root = os.path.join(ROOT, "images")
-    lbl_root = os.path.join(ROOT, "labels")
+    img_root = os.path.join(root, "images")
+    lbl_root = os.path.join(root, "labels")
     for subdir in sorted(os.listdir(img_root)):
         idir, ldir = os.path.join(img_root, subdir), os.path.join(lbl_root, subdir)
         if not os.path.isdir(idir):
@@ -45,6 +45,7 @@ def list_pairs():
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--limit", type=int, default=16, help="number of tiles (tiny subset first)")
+    ap.add_argument("--root", default=ROOT, help="dataset root with images/ + labels/ subdirs")
     ap.add_argument("--cache", default=CACHE)
     ap.add_argument("--manifest", default=None)
     ap.add_argument("--nshards", type=int, default=1, help="total shards (for parallel runs)")
@@ -61,7 +62,7 @@ def main():
     manifest = args.manifest or os.path.join(args.cache, "manifest.csv")
     anno = None if args.all_annos else args.anno_names
 
-    pairs = list_pairs()[: args.limit]
+    pairs = list_pairs(args.root)[: args.limit]
     shard_pairs = pairs[args.shard:: args.nshards] if args.nshards > 1 else pairs
     print(f"found {len(pairs)} pairs; shard {args.shard}/{args.nshards} -> {len(shard_pairs)} tiles "
           f"| anno_names={anno}")

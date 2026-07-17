@@ -37,6 +37,12 @@ def ridgepath_loss(logits: torch.Tensor, targets: torch.Tensor):
     if targets.shape[1] != 10:
         raise ValueError(f"expected 10 target channels (dim=1), got shape {tuple(targets.shape)}")
 
+    # Numerical guard for AMP/fp16: cap logits so the forward can't overflow fp16 (max ~65504) to inf->NaN.
+    # softmax/sigmoid already saturate by ~±15, so clamping at ±30 leaves predictions/gradients unchanged
+    # for any reasonable logit but keeps the loss finite even if a logit blows up. (fp16 NaN was a forward
+    # overflow that grad-clipping cannot catch; this is the actual fix.)
+    logits = logits.clamp(-30.0, 30.0)
+
     # Semantic: sigmoid cross-entropy, unweighted, mean over all pixels.
     segment_loss = F.binary_cross_entropy_with_logits(
         logits[:, 0], targets[:, 0], reduction="mean"

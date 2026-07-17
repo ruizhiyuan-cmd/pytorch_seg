@@ -5,9 +5,9 @@ encoder: tenxnet_recipe                 # v1 stem, SD 0.5, endpoints 1..5 (FPN m
 in_chans: 2
 num_classes: 9
 
-manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train_local.csv
-val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val_local.csv
-augment: true
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_overfit5.csv
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_overfit5.csv
+augment: false
 seg_channels: [boundary, DAPI]          # large_cell_boundary image order: ch0=boundary, ch1=DAPI
 target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
 
@@ -15,16 +15,15 @@ init: scratch
 
 optimizer: adamw
 lr: 0.01
-weight_decay: 0.0001
-lr_schedule: cosine
-warmup_epochs: 5
+weight_decay: 0.0
+lr_schedule: constant
+warmup_epochs: 0
 epochs: 1000
-batch_size: 16                          # per-GPU; match tenxnet_recipe_dino_boundary2ch for a fair ablation
-num_workers: 8
+batch_size: 5                          # per-GPU; match tenxnet_recipe_dino_boundary2ch for a fair ablation
+num_workers: 0
 amp: false
-grad_clip: 5.0
 
-out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_scratch
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_overfit5
 seed: 0
-save_every: 10
-log_every: 20
+save_every: 25
+log_every: 50

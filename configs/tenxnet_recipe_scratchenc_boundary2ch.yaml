@@ -1,0 +1,43 @@
+# CONTROL: frozen train-from-scratch ENCODER + fresh decoder/heads.
+# Parallels the frozen-SSL probe (tenxnet_recipe_ibot_boundary2ch.yaml) but swaps the pretrained
+# encoder: instead of the iBOT/SSL encoder, load the encoder from the best train-from-scratch seg
+# checkpoint, FULLY freeze it, and train only a randomly-reinitialized decoder + output heads.
+# Isolates "how good are the from-scratch encoder's features for a fresh decoder?" as a baseline
+# for the SSL-encoder probe. Everything below (data split, aug, loss, batch, seed) matches the
+# frozen-SSL probe; the ONE unavoidable difference is encoder_norm (bn here) because the source
+# from-scratch checkpoint is BatchNorm -- the two encoders being compared genuinely differ in norm.
+encoder: tenxnet_recipe                 # v1 stem, SD 0.5, endpoints 1..5 (FPN min_level 1)
+encoder_norm: bn                        # MUST match the source scratch ckpt (runs/tenxnet_recipe_scratch = bn)
+in_chans: 2
+num_classes: 9
+
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train_local.csv   # same split as the SSL probe
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val_local.csv
+augment: true
+seg_channels: [boundary, DAPI]
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
+
+# --- load ONLY the encoder from the best from-scratch seg run; discard its decoder/heads ---
+init: seg_encoder
+seg_checkpoint: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_scratch/best.pth  # ep756, val 1.17
+freeze_encoder_eval: true               # hold the encoder fixed (eval mode: SD/dropout off, BN stats frozen)
+
+optimizer: adamw
+lr: 0.003                               # decoder/head LR; multistep drops it to 0.001
+weight_decay: 0.0001
+lr_schedule: multistep
+lr_milestone_unit: epochs
+lr_milestones: [180]                    # single drop 3e-3 -> 1e-3 (mirrors the SSL-probe schedule region)
+lr_values: [0.003, 0.001]
+warmup_epochs: 5
+epochs: 500
+batch_size: 20                          # per-GPU (== frozen-SSL probe)
+num_workers: 8
+amp: true
+grad_clip: 5.0
+freeze_encoder_epochs: 500              # == epochs -> encoder frozen for the WHOLE run (requires_grad=False)
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/tenxnet_recipe_scratchenc_boundary2ch
+seed: 0
+save_every: 10
+log_every: 20
