@@ -18,8 +18,14 @@ cfg = yaml.safe_load(open(args.config)); ckpt = args.ckpt; out = args.out; N = a
 manifest = cfg["manifest"] if args.split == "train" else cfg["val_manifest"]
 os.makedirs(out, exist_ok=True)
 dev = torch.device("cpu")
+# model_kwargs match training; force pretrained=False for convnext (weights come from the ckpt below,
+# not an HF download at decode time).
+mk = dict(cfg.get("model_kwargs") or {})
+if cfg["encoder"] in ("convnext_dino_hires", "hires_only"):
+    mk["pretrained"] = False
 model = build_seg_model(encoder_name=cfg["encoder"], in_chans=cfg["in_chans"],
-                        num_classes=cfg["num_classes"], encoder_norm=cfg.get("encoder_norm", "bn")).to(dev)
+                        num_classes=cfg["num_classes"], encoder_norm=cfg.get("encoder_norm", "bn"),
+                        gn_max_groups=cfg.get("gn_max_groups", 32), **mk).to(dev)
 ck = torch.load(ckpt, map_location=dev, weights_only=False)
 model.load_state_dict(ck["model"]); model.eval()
 print(f"loaded {ckpt} (epoch {ck.get('epoch','?')})")

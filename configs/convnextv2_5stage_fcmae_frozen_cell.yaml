@@ -1,0 +1,41 @@
+# FROZEN FCMAE-pretrained 5-stage ConvNeXt-V2 encoder -> P1-P5 FPN -> Ridgepath head (bilinear x2 to full res).
+# Frozen-transfer PROBE: freeze the whole SSL encoder, train only FPN + head. Clean measure of whether the
+# on-domain FCMAE (atto continue-SSL on 229k boundary tiles) features help large-cell boundary seg.
+# The 5-stage encoder gives a NATIVE stride-2 (level-1) endpoint, so no hi-res branch is needed
+# (RidgepathSegModel: fpn_min_level=1, head_level=1, final bilinear x2 -> full res -- the tenxnet_recipe path).
+#
+# Encoder weights: FCMAE sparse encoder -> dense (remap_checkpoint_keys) -> packaged for restore_seg_encoder
+# at cache/fcmae_5stage_atto_seg_encoder.pth (160 tensors, loads 0-missing/0-unexpected).
+encoder: convnextv2_5stage
+in_chans: 2
+num_classes: 9
+model_kwargs: {}                       # RidgepathSegModel path; fpn/head defaults set by build_seg_model
+
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_cell_train.csv    # 6073 labeled normal-cell tiles
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_cell_val.csv  # 709 labeled tiles
+augment: true
+seg_channels: [boundary, DAPI]                 # ch0=boundary, ch1=DAPI (matches FCMAE 2-ch pretraining)
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
+
+# --- frozen SSL encoder: load pretrained weights, freeze whole run ---
+init: seg_encoder
+seg_checkpoint: /mnt/home/ruizhi.yuan/pytorch_seg/cache/fcmae_5stage_atto_seg_encoder.pth
+freeze_encoder_epochs: 300          # == epochs -> encoder frozen for the whole run (requires_grad=False)
+freeze_encoder_eval: true           # encoder in .eval() each epoch (LayerNorm/GRN are batch-independent)
+
+optimizer: adamw
+lr: 0.003                           # single LR: FPN + head (random-init); encoder LR gated to 0 while frozen
+weight_decay: 0.0001
+lr_schedule: cosine
+warmup_epochs: 5
+epochs: 300
+batch_size: 32                      # frozen small encoder + full-res head; tune to VRAM
+num_workers: 8
+amp: true
+amp_dtype: bf16                     # Ada GPU
+grad_clip: 5.0
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/convnextv2_5stage_fcmae_frozen_cell
+seed: 0
+save_every: 10
+log_every: 20

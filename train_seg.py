@@ -28,7 +28,8 @@ from torch.utils.data import DataLoader, DistributedSampler
 from data.seg_dataset import RidgepathSegDataset, seg_worker_init_fn
 from losses.ridgepath_loss import ridgepath_loss
 from models.encoder_decoder import build_seg_model
-from restore import restore_dino_into_resnet18, restore_dino_into_tenxnet, restore_seg_encoder
+from restore import (restore_dino_into_resnet18, restore_dino_into_tenxnet, restore_seg_encoder,
+                     restore_seg_full)
 
 DEFAULTS = dict(
     encoder="resnet18", in_chans=2, num_classes=9,
@@ -42,6 +43,7 @@ DEFAULTS = dict(
     dino_which="student", ssl_channels=["DAPI", "boundary", "18S", "avim"],
     seg_checkpoint=None,  # init=seg_encoder: source pytorch_seg ckpt whose ENCODER is loaded (decoder/heads discarded)
     freeze_encoder_eval=False,  # keep encoder in .eval() during training (freezes SD/dropout + BN running stats)
+    model_kwargs=dict(),  # extra kwargs forwarded to build_seg_model (e.g. convnext: pretrained/timm_model/hires_c0/c1)
     optimizer="adamw", lr=1e-3, encoder_lr=None, weight_decay=1e-4, betas=[0.9, 0.999],
     lr_schedule="cosine", warmup_epochs=0, min_lr=1e-6,
     lr_milestones=None, lr_values=None, lr_milestone_unit="steps",  # multistep: boundaries in "steps" or "epochs" + absolute LR per segment
@@ -49,6 +51,7 @@ DEFAULTS = dict(
     encoder_lr_follows_schedule=True,  # False -> encoder holds a constant encoder_lr (NOT scaled by the decoder's schedule factor)
     grad_clip=1.0,  # clip grad-norm to this (None/<=0 disables); watch clip_frac in the log to tune it
     epochs=100, batch_size=8, num_workers=4, amp=True,
+    amp_dtype="fp16",  # AMP compute dtype: "fp16" (broad HW, needs GradScaler) or "bf16" (Ampere/Ada+, no scaler, robust for fine-tuning)
     out_dir="/mnt/home/ruizhi.yuan/pytorch_seg/runs/run", seed=0, save_every=10, log_every=10,
 )
 
@@ -238,6 +241,11 @@ def main():
             cfg["batch_size"] = 2
         if args.max_iters is None:
             args.max_iters = 20
+        # SAFETY: a smoke run must never write into a real run's out_dir (its 1-epoch best.pth would
+        # clobber a fully-trained checkpoint). Unless the user explicitly redirected --out-dir, sandbox
+        # smoke output under a sibling "<out_dir>_smoke" directory.
+        if args.out_dir is None:
+            cfg["out_dir"] = cfg["out_dir"].rstrip("/") + "_smoke"
 
     ddp, rank, world, local_rank = setup_dist(args.ddp)
     device = torch.device(args.device or ("cuda" if torch.cuda.is_available() else "cpu"))
@@ -250,12 +258,12 @@ def main():
         with open(os.path.join(cfg["out_dir"], "config.json"), "w") as fh:
             json.dump(cfg, fh, indent=2)  # snapshot the resolved config for this run
         print(f"device={device} ddp={ddp} world={world} | encoder={cfg['encoder']} "
-              f"init={cfg['init']} amp={cfg['amp']}")
+              f"init={cfg['init']} amp={cfg['amp']}({cfg['amp_dtype'] if cfg['amp'] else 'off'})")
 
     # model
     model = build_seg_model(encoder_name=cfg["encoder"], in_chans=cfg["in_chans"],
                             num_classes=cfg["num_classes"], encoder_norm=cfg["encoder_norm"],
-                            gn_max_groups=cfg["gn_max_groups"]).to(device)
+                            gn_max_groups=cfg["gn_max_groups"], **cfg["model_kwargs"]).to(device)
     if cfg["init"] == "dino":
         if is_main(rank):
             if cfg["encoder"] == "resnet18":
@@ -278,6 +286,19 @@ def main():
             restore_seg_encoder(model, cfg["seg_checkpoint"])
         if ddp:
             dist.barrier()   # DDP wrap below broadcasts rank-0 weights to all replicas
+    elif cfg["init"] == "seg_full":
+        # LP-FT warm-start: load the WHOLE model (encoder + trained decoder + heads) from a completed
+        # frozen-encoder run, then continue with a FRESH optimizer/schedule (small encoder_lr set below).
+        # Unlike --resume, this keeps the optimizer pristine so the encoder does NOT inherit the probe's
+        # hot base_lr. Build with model_kwargs.pretrained=false (weights come from the checkpoint).
+        if not cfg["seg_checkpoint"]:
+            raise ValueError("init=seg_full requires 'seg_checkpoint' in the config")
+        if is_main(rank):
+            restore_seg_full(model, cfg["seg_checkpoint"])
+        if ddp:
+            dist.barrier()   # DDP wrap below broadcasts rank-0 weights to all replicas
+    elif cfg["init"] == "timm_convnext":
+        pass  # weights are loaded by timm at build (build_seg_model / ConvNeXtDinoV3Features); no restore
     # LP-FT: TRULY freeze the encoder (requires_grad=False -> no encoder backward, no grads in the clip
     # norm, pristine optimizer state) for the first N epochs. Set BEFORE the DDP wrap so the reducer
     # excludes the encoder; we re-wrap DDP at unfreeze so the encoder's grads sync across ranks.
@@ -313,12 +334,17 @@ def main():
         print(f"[optim] decoder lr={base_lr:.2e} | encoder lr={enc_lr:.2e} "
               f"({len(dec_params)} decoder + {len(enc_params)} encoder tensors)"
               + (f" | encoder FROZEN (lr=0) for first {frz} epochs, then unfreeze" if frz else ""))
-    # AMP uses float16 (T4/Turing has fp16 tensor cores but runs bf16 unaccelerated -> bf16 too slow).
-    # fp16 needs the GradScaler: it rescues NON-finite GRADIENTS (backward overflow) by skipping the
-    # step + backing off the scale. A non-finite LOSS (forward overflow) can't be rescaled away and is
-    # handled separately in the loop (skip the batch, don't crash). amp=false -> fp32 native.
+    # AMP dtype is config-selectable (amp_dtype: "fp16" | "bf16").
+    #   fp16: broadest HW support (incl. T4/Turing fp16 tensor cores) but a NARROW exponent range -> can
+    #         overflow, so it needs the GradScaler (rescues non-finite GRADS by skipping the step + backing
+    #         off the scale) and is prone to NaN once the deep trunk unfreezes.
+    #   bf16: fp32-range exponent -> effectively no overflow, so NO GradScaler and far more robust for
+    #         fine-tuning; but needs Ampere/Ada+ to be fast (bf16 is unaccelerated on T4/Turing).
+    # A non-finite LOSS (forward overflow) is still handled in the loop (skip the batch). amp=false -> fp32.
     amp_on = cfg["amp"] and device.type == "cuda"
-    scaler = torch.amp.GradScaler("cuda", enabled=amp_on)
+    amp_dtype = torch.bfloat16 if str(cfg["amp_dtype"]).lower() in ("bf16", "bfloat16") else torch.float16
+    # GradScaler ONLY for fp16 (bf16 has no overflow to rescale; a bf16 scaler would be incorrect).
+    scaler = torch.amp.GradScaler("cuda", enabled=(amp_on and amp_dtype == torch.float16))
 
     _, loader, sampler = build_loader(cfg["manifest"], cfg, ddp, shuffle=True, augment=cfg["augment"])
     steps_per_epoch = max(1, len(loader))
@@ -404,7 +430,7 @@ def main():
                     g["lr"] = 0.0 if frozen_enc else (g["base_lr"] * factor if enc_follows else g["base_lr"])
                 else:
                     g["lr"] = g["base_lr"] * factor   # decoder/head always follows the schedule
-            with torch.autocast(device_type=device.type, dtype=torch.float16, enabled=amp_on):
+            with torch.autocast(device_type=device.type, dtype=amp_dtype, enabled=amp_on):
                 logits = model(img)
                 loss, seg, row, col = ridgepath_loss(logits, tgt)
             # fp16 forward overflow (esp. once the deep SSL encoder is unfrozen): an inf activation ->

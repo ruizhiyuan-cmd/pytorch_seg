@@ -246,3 +246,47 @@ def restore_seg_encoder(seg_model, ckpt_path, verbose=True):
         if unexpected:
             print(f"[restore]   UNEXPECTED source encoder keys (ignored): {unexpected}")
     return dict(loaded=sorted(tkeys & pkeys), unexpected=unexpected, epoch=ck.get("epoch"))
+
+
+def restore_seg_full(seg_model, ckpt_path, verbose=True):
+    """Load the ENTIRE model (encoder + decoder + heads) from a pytorch_seg checkpoint into ``seg_model``.
+
+    Used by the ``init: seg_full`` LP-FT warm-start: take a completed frozen-encoder ("linear-probe")
+    run and continue with the encoder UNFROZEN, but with a FRESH optimizer / schedule / small encoder LR
+    (which a plain ``--resume`` cannot give -- resume restores the saved optimizer's param-groups, so the
+    encoder would inherit the probe's hot base_lr and overwrite the pretrained features). Here we load
+    weights only; train_seg builds the optimizer from the NEW config.
+
+    Source and target MUST be the same architecture (same encoder/decoder/head config) so keys align
+    1:1; we assert 0 missing and 0 unexpected keys (a partial load would silently leave part of the
+    model at random init). Build the target with ``model_kwargs.pretrained: false`` -- the ConvNeXt
+    weights come from this checkpoint (identical to DINOv3 since the probe kept the encoder frozen), so
+    no HF download is needed.
+    """
+    raw = seg_model.module if hasattr(seg_model, "module") else seg_model
+    target_sd = raw.state_dict()
+    ck = torch.load(ckpt_path, map_location="cpu", weights_only=False)
+    if "model" not in ck:
+        raise KeyError(f"checkpoint has no 'model' key (keys: {list(ck.keys())})")
+    src = ck["model"]
+
+    tkeys, pkeys = set(target_sd), set(src)
+    shape_mismatch = sorted(k for k in tkeys & pkeys if target_sd[k].shape != src[k].shape)
+    if shape_mismatch:
+        details = [f"{k}: seg{tuple(target_sd[k].shape)} vs ckpt{tuple(src[k].shape)}"
+                   for k in shape_mismatch]
+        raise ValueError("model shape mismatch on keys:\n  " + "\n  ".join(details))
+    missing = sorted(tkeys - pkeys)      # target params absent from source -> would stay random
+    unexpected = sorted(pkeys - tkeys)   # source params absent from target
+    if missing or unexpected:
+        raise ValueError(
+            f"seg_full warm-start key mismatch: {len(missing)} missing, {len(unexpected)} unexpected.\n"
+            f"  missing (would stay random): {missing[:8]}{' ...' if len(missing) > 8 else ''}\n"
+            f"  unexpected (in ckpt, not model): {unexpected[:8]}{' ...' if len(unexpected) > 8 else ''}\n"
+            "=> the source run must be the SAME architecture/config as this one.")
+
+    raw.load_state_dict(src, strict=True)
+    if verbose:
+        print(f"[restore] seg FULL model from {ckpt_path} (source epoch {ck.get('epoch','?')}) "
+              f"-> {len(tkeys)} tensors loaded (encoder + decoder + heads); fresh optimizer/schedule")
+    return dict(loaded=sorted(tkeys), epoch=ck.get("epoch"))

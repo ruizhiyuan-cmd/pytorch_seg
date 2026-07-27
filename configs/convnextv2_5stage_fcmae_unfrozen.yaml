@@ -1,0 +1,41 @@
+# UNFROZEN (fine-tuned) FCMAE-pretrained 5-stage ConvNeXt-V2 encoder -> P1-P5 FPN -> Ridgepath head.
+# Load the on-domain FCMAE encoder and fine-tune it end-to-end: tiny encoder LR (adapt, don't wipe the
+# SSL features) + normal decoder LR (FPN+head are random). Pair with the frozen probe
+# (convnextv2_5stage_fcmae_frozen.yaml) to see whether fine-tuning beats frozen transfer.
+encoder: convnextv2_5stage
+in_chans: 2
+num_classes: 9
+model_kwargs: {}                       # RidgepathSegModel path; fpn/head defaults set by build_seg_model
+
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_train_local.csv    # 733 labeled large-cell tiles
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_val_local.csv  # 84 labeled tiles
+augment: true
+seg_channels: [boundary, DAPI]
+target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
+
+# --- load pretrained FCMAE encoder, then fine-tune UNFROZEN ---
+init: seg_encoder
+seg_checkpoint: /mnt/home/ruizhi.yuan/pytorch_seg/cache/fcmae_5stage_atto_seg_encoder.pth
+freeze_encoder_epochs: 0            # unfrozen from step 1
+freeze_encoder_eval: false          # encoder in TRAIN mode (BN/DropPath n/a here; LayerNorm/GRN batch-independent)
+
+optimizer: adamw
+lr: 0.003                           # decoder (FPN + head, random-init)
+encoder_lr: 0.0003                  # FCMAE encoder ~lr/10: on-domain SSL features adapt but aren't wiped
+encoder_lr_follows_schedule: true   # encoder LR cosine-decays with the decoder factor
+weight_decay: 0.0001
+lr_schedule: cosine
+warmup_epochs: 5                    # protects the pretrained encoder from the random decoder's early gradient shock
+epochs: 300
+batch_size: 64                      # full backprop through the encoder + full-res activations -> lower than frozen; tune to VRAM
+num_workers: 8
+amp: true
+amp_dtype: bf16                     # Ada GPU
+grad_clip: null                     # clip encoder-grad spikes on the freshly-unfrozen trunk
+
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/convnextv2_5stage_fcmae_unfrozen
+seed: 0
+save_every: 10
+log_every: 20
+
+
