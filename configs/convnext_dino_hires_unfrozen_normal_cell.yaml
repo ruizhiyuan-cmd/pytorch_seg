@@ -17,10 +17,17 @@ in_chans: 2
 num_classes: 9
 model_kwargs: {pretrained: true, timm_model: "convnext_tiny.dinov3_lvd1689m", hires_c0: 32, hires_c1: 32, gn_groups: 8}
 
-manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_cell_train.csv    # 6073 labeled normal-cell tiles
-val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_cell_val.csv  # 709 labeled tiles
+manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_cell_tenxnet_train.csv    # 6073 labeled normal-cell tiles
+val_manifest: /mnt/home/ruizhi.yuan/pytorch_seg/cache/manifest_cell_tenxnet_val.csv  # 709 labeled tiles
 
 augment: true
+aug:
+  color_quant_bins: [64, 128, 256, 512]
+  color_quant_prob: 0.5
+  brightness_delta: 0.0
+  contrast_range: [1.0, 1.0]
+  mirror_prob: 0.0
+  rot_choices: [0]
 seg_channels: [boundary, DAPI]                 # ch0=boundary, ch1=DAPI
 target_params: {dist_cutoff: 15.0, weight_sigma: 1.0, smooth_range: 3, weighted_loss: true}
 
@@ -37,14 +44,14 @@ weight_decay: 0.0001
 lr_schedule: cosine
 warmup_epochs: 5                    # protects the pretrained encoder from the random decoder's early gradient shock
 min_lr: 0.000001
-epochs: 500                         # full run (decoder trains from scratch) -- matches the frozen probe for a fair comparison
-batch_size: 16                      # backward now flows through the 28M-param trunk + full-res activations -> much heavier than the frozen run's 64; tune to VRAM (>=8)
+epochs: 300                         # full run (decoder trains from scratch) -- matches the frozen probe for a fair comparison
+batch_size: 32                      # backward now flows through the 28M-param trunk + full-res activations -> much heavier than the frozen run's 64; tune to VRAM (>=8)
 num_workers: 8
 amp: true
 amp_dtype: bf16                     # Ada GPU: bf16 (fp32-range exponent) removes the fp16 NaN risk of unfrozen deep-trunk training
 grad_clip: null                      # tighter than the probe's 5.0 -- clip encoder-grad spikes
 
-out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/convnext_dino_hires_unfrozen_normal_cell
+out_dir: /mnt/home/ruizhi.yuan/pytorch_seg/runs/convnext_dino_hires_unfrozen_normal_cell_tenxnet_split   # UNFROZEN DINOv3 ConvNeXt-Tiny + parallel high-res branch -> Ridgepath heads
 seed: 0
 save_every: 10
 log_every: 20
