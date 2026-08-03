@@ -24,12 +24,13 @@ class RidgepathSegModel(nn.Module):
                  fpn_min_level=2, fpn_max_level=5, fpn_filters=32,
                  head_level=2, head_filters=32, head_num_convs=2,
                  prediction_kernel_size=1, final_upsample_mode="bilinear",
-                 encoder_norm="bn", gn_max_groups=32):
+                 encoder_norm="bn", gn_max_groups=32, enc_kwargs=None):
         super().__init__()
         # Only the ENCODER may switch to GroupNorm (SSL->seg handoff needs matching norm/keys); the
-        # FPN + head stay BatchNorm (never masked, never cross the SSL boundary).
+        # FPN + head stay BatchNorm (never masked, never cross the SSL boundary). enc_kwargs forwards
+        # encoder-specific options (e.g. convnext_dino: pretrained/model_name) to build_encoder.
         self.encoder = build_encoder(encoder_name, in_chans, encoder_norm=encoder_norm,
-                                     gn_max_groups=gn_max_groups)
+                                     gn_max_groups=gn_max_groups, **(enc_kwargs or {}))
         self.fpn = FPN(self.encoder.output_specs, fpn_min_level, fpn_max_level, fpn_filters)
         self.head = SegmentationHead(
             num_classes=num_classes, level=head_level, in_channels=fpn_filters,
@@ -116,6 +117,18 @@ def build_seg_model(encoder_name="resnet18", in_chans=2, num_classes=9,
         return ConvNeXtHiResSegModel(in_chans=in_chans, num_classes=num_classes,
                                      use_convnext=(encoder_name == "convnext_dino_hires"),
                                      **overrides)
+    if encoder_name == "convnext_dino":
+        # DINOv3 ConvNeXt-Tiny 4-stage backbone ALONE (no hi-res branch): 4-stage FPN over P2-P5
+        # (strides 4/8/16/32) -> head at level 2 (stride 4) -> one bilinear x4 to full res. model_kwargs
+        # (pretrained/model_name) forward to the encoder; `timm_model` is accepted as a model_name alias.
+        mk = dict(overrides)
+        if "timm_model" in mk:
+            mk["model_name"] = mk.pop("timm_model")
+        return RidgepathSegModel(
+            encoder_name="convnext_dino", in_chans=in_chans, num_classes=num_classes,
+            fpn_min_level=2, fpn_max_level=5, fpn_filters=32, head_level=2, head_filters=32,
+            head_num_convs=2, prediction_kernel_size=1, final_upsample_mode="bilinear",
+            encoder_norm=encoder_norm, gn_max_groups=gn_max_groups, enc_kwargs=mk)
     defaults = dict(fpn_min_level=2, fpn_max_level=5, fpn_filters=32,
                     head_filters=32, head_num_convs=2, prediction_kernel_size=1,
                     encoder_norm=encoder_norm, gn_max_groups=gn_max_groups)
